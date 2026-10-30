@@ -13,7 +13,11 @@ from flet_audio_recorder import (
 )
 
 from ia import ia
-from multimedia import ia_media, ia_media_multimodal, pcm_a_wav
+from multimedia import (
+    ia_media,
+    ia_media_multimodal,
+    pcm_a_wav,
+)
 
 FORMATO_RIMA = (
     "Devuelve únicamente un objeto JSON con exactamente estos campos: "
@@ -40,6 +44,74 @@ PATRONES_DATOS_SENSIBLES = (
         "un posible número de teléfono",
     ),
 )
+
+
+def mime_imagen(datos: bytes) -> str:
+    if datos.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if datos.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    raise RuntimeError("La imagen debe ser un archivo JPG o PNG válido.")
+
+
+def explicar_error_ia(error: Exception, mensaje: str) -> str:
+    if not isinstance(error, RuntimeError):
+        return mensaje
+
+    detalle = str(error).lower()
+    if (
+        "la ia respondió con error" in detalle
+        and ("400/403: clave" in detalle or "404: modelo" in detalle)
+    ):
+        return (
+            "Esta instancia todavía está ejecutando la integración anterior "
+            "de Gemini. Detén por completo el servidor y vuelve a iniciarlo "
+            "desde la carpeta del proyecto actualizado. Para Grok, configura "
+            "XAI_API_KEY en ese mismo entorno."
+        )
+    if re.search(r"xai respondió con error 429\b", detalle):
+        mensaje_api = str(error).split(": ", 1)
+        detalle_api = (
+            mensaje_api[1][:180]
+            if len(mensaje_api) > 1
+            else "xAI alcanzó un límite de uso."
+        )
+        return (
+            "Grok rechazó la solicitud por un límite de uso. Revisa la cuota "
+            "del equipo de xAI asociado a XAI_API_KEY o espera si es un límite "
+            f"temporal. Detalle: {detalle_api}"
+        )
+    if "xai_api_key" in detalle:
+        return str(error)
+    if re.search(r"xai respondió con error (?:401|403)\b", detalle):
+        return (
+            "xAI rechazó la clave. Verifica que XAI_API_KEY sea válida "
+            "y tenga acceso a la API."
+        )
+    if re.search(r"xai respondió con error 404\b", detalle):
+        detalle_api = str(error)[len("xAI respondió con error ") :][:180]
+        return (
+            "xAI no encontró el modelo configurado. Revisa XAI_MODEL o "
+            "elimina esa variable para usar el modelo predeterminado. "
+            f"Detalle: {detalle_api}"
+        )
+    if "400" in detalle:
+        return (
+            "La solicitud no pudo procesarse. Revisa el contenido e "
+            "inténtalo de nuevo."
+        )
+    if any(
+        palabra in detalle
+        for palabra in ("network", "connection", "connect", "timeout", "red")
+    ):
+        return (
+            "No se pudo conectar con el servicio. Revisa tu conexión "
+            "a internet e inténtalo de nuevo."
+        )
+    return (
+        "El servicio de rimas tuvo un problema. Inténtalo de nuevo "
+        "dentro de unos momentos."
+    )
 
 
 def vista(page: ft.Page | None = None) -> ft.Control:
@@ -222,33 +294,11 @@ def vista(page: ft.Page | None = None) -> ft.Control:
         pagina.update()
 
     def informar_error(pagina: ft.Page, error: Exception, mensaje: str):
-        explicacion = mensaje
-        if isinstance(error, RuntimeError):
-            detalle = str(error).lower()
-            if "429" in detalle or "rate limit" in detalle or "too many" in detalle:
-                explicacion = (
-                    "El servicio está recibiendo demasiadas solicitudes. "
-                    "Espera un poco y vuelve a intentarlo."
-                )
-            elif "400" in detalle:
-                explicacion = (
-                    "La solicitud no pudo procesarse. Revisa el contenido e "
-                    "inténtalo de nuevo."
-                )
-            elif any(
-                palabra in detalle
-                for palabra in ("network", "connection", "connect", "timeout", "red")
-            ):
-                explicacion = (
-                    "No se pudo conectar con el servicio. Revisa tu conexión "
-                    "a internet e inténtalo de nuevo."
-                )
-            else:
-                explicacion = (
-                    "El servicio de rimas tuvo un problema. Inténtalo de nuevo "
-                    "dentro de unos momentos."
-                )
-        mostrar_alerta(pagina, explicacion, ft.Colors.RED)
+        mostrar_alerta(
+            pagina,
+            explicar_error_ia(error, mensaje),
+            ft.Colors.RED,
+        )
 
     def reservar_generacion(pagina: ft.Page) -> bool:
         nonlocal generaciones
@@ -548,6 +598,7 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                 pagina.update()
                 return
 
+            tipo_imagen = mime_imagen(imagen.bytes)
             nombre_foto.value = imagen.name
             texto_leido.value = ""
             datos_documento.value = ""
@@ -567,7 +618,7 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                 "No describas la imagen. Si no hay texto visible, responde "
                 "exactamente: SIN_TEXTO",
                 imagen.bytes,
-                "image/jpeg",
+                tipo_imagen,
             )
             texto_extraido = (
                 texto_extraido.strip() if isinstance(texto_extraido, str) else ""
@@ -600,7 +651,7 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                 + FORMATO_RIMA
                 + contexto_historial(),
                 imagen.bytes,
-                "image/jpeg",
+                tipo_imagen,
                 como_json=True,
             )
             respuesta = validar_respuesta_rima(respuesta)
@@ -739,7 +790,10 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                 respuesta = await asyncio.to_thread(
                     ia_media_multimodal,
                     instruccion + "\n\n" + FORMATO_RIMA,
-                    [(imagen, "image/jpeg"), (datos_wav, "audio/wav")],
+                    [
+                        (imagen, mime_imagen(imagen)),
+                        (datos_wav, "audio/wav"),
+                    ],
                     f"Instrucción dictada: {tema}{contexto_historial()}",
                     True,
                 )

@@ -10,6 +10,9 @@ def main(page: ft.Page):
 
     def abrir(nombre):
         def _abrir(e):
+            importlib.reload(importlib.import_module("ia"))
+            if nombre == "rimador":
+                importlib.reload(importlib.import_module("multimedia"))
             modulo = importlib.reload(importlib.import_module(f"apps.{nombre}"))
             # Si la app pide "page" (para usar micrófono o selector de archivos), se la pasamos.
             pide_page = len(inspect.signature(modulo.vista).parameters) > 0
