@@ -31,3 +31,52 @@ def ia_media(instruccion, datos, mime, texto="", como_json=False):
         t = t.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         return json.loads(t)
     return t
+
+def ia_media_multimodal(instruccion, archivos, texto="", como_json=False):
+    """Envía una instrucción y varios archivos multimedia en una sola petición a Gemini."""
+    clave = os.getenv("GEMINI_API_KEY", "")
+    if not clave:
+        raise RuntimeError("Falta GEMINI_API_KEY: defínela en tu terminal o en el secret del Space.")
+
+    pedido = instruccion + ("\n\nTexto: " + texto if texto else "")
+    partes = [{"text": pedido}]
+    for datos, mime in archivos:
+        if len(datos) > 15_000_000:
+            raise RuntimeError("El archivo es muy grande (máximo 15 MB). Usa uno más corto.")
+        partes.append(
+            {
+                "inline_data": {
+                    "mime_type": mime,
+                    "data": base64.b64encode(datos).decode(),
+                }
+            }
+        )
+
+    cfg = {"responseMimeType": "application/json"} if como_json else {}
+    respuesta = httpx.post(
+        URL,
+        timeout=60,
+        headers={"x-goog-api-key": clave},
+        json={
+            "contents": [{"parts": partes}],
+            "generationConfig": cfg,
+        },
+    )
+    if respuesta.status_code != 200:
+        raise RuntimeError(
+            f"La IA respondió con error {respuesta.status_code}. "
+            "400/403: clave o archivo no válido; 404: modelo; "
+            "429: espera un momento."
+        )
+
+    texto_respuesta = respuesta.json()["candidates"][0]["content"]["parts"][0]["text"]
+    if como_json:
+        texto_respuesta = (
+            texto_respuesta.strip()
+            .removeprefix("```json")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
+        return json.loads(texto_respuesta)
+    return texto_respuesta

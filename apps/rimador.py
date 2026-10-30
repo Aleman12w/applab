@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import re
 from urllib.parse import quote
 
 import flet as ft
@@ -12,13 +13,32 @@ from flet_audio_recorder import (
 )
 
 from ia import ia
-from multimedia import ia_media, pcm_a_wav
+from multimedia import ia_media, ia_media_multimodal, pcm_a_wav
 
 FORMATO_RIMA = (
     "Devuelve únicamente un objeto JSON con exactamente estos campos: "
     '"titulo", "verso1", "verso2", "verso3", "verso4" y "estilo". '
     "Todos los valores deben ser texto no vacío; cada verso debe ser una "
     "sola línea y los cuatro versos deben formar una rima."
+)
+MAX_GENERACIONES = 10
+PATRONES_DATOS_SENSIBLES = (
+    (
+        re.compile(r"(?<!\d)\d{8}\s*-\s*\d(?!\d)"),
+        "un número de DUI",
+    ),
+    (
+        re.compile(
+            r"\b(?:contrase(?:ñ|n)a|password|passwd|passphrase|clave)"
+            r"\s*(?:es|:|=)\s*\S+",
+            re.IGNORECASE,
+        ),
+        "una posible contraseña",
+    ),
+    (
+        re.compile(r"(?<!\d)(?:\+?\d[\s().-]*){7,15}(?!\d)"),
+        "un posible número de teléfono",
+    ),
 )
 
 
@@ -62,6 +82,30 @@ def vista(page: ft.Page | None = None) -> ft.Control:
     )
     rimas_anteriores: list[dict[str, str]] = []
     rima_actual: dict[str, str] | None = None
+    me_gusta = 0
+    no_me_gusta = 0
+    generaciones = 0
+    contador_generaciones = ft.Text(
+        f"Generaciones disponibles: {MAX_GENERACIONES}",
+        color=ft.Colors.CYAN_ACCENT,
+    )
+    alerta_texto = ft.Text(color=ft.Colors.WHITE)
+    tarjeta_alerta = ft.Card(
+        content=ft.Container(
+            content=ft.Row(
+                [
+                    ft.Icon(ft.Icons.INFO_OUTLINE, color=ft.Colors.ORANGE),
+                    alerta_texto,
+                ],
+                spacing=10,
+            ),
+            bgcolor="#3B2A17",
+            border=ft.Border.all(1, ft.Colors.ORANGE),
+            border_radius=10,
+            padding=12,
+        ),
+        visible=False,
+    )
     portapapeles = ft.Clipboard()
     lanzador_url = ft.UrlLauncher()
     boton = ft.Button(
@@ -72,12 +116,19 @@ def vista(page: ft.Page | None = None) -> ft.Control:
         ),
     )
     boton_copiar = ft.Button("Copiar Rima", disabled=True)
+    boton_me_gusta = ft.Button("👍", tooltip="Me gusta", disabled=True)
+    boton_no_me_gusta = ft.Button("👎", tooltip="No me gusta", disabled=True)
+    estadisticas_calificacion = ft.Text(
+        "👍 0 me gusta  ·  👎 0 no me gusta",
+        color=ft.Colors.CYAN_ACCENT,
+    )
     boton_microfono = ft.IconButton(
         icon=ft.Icons.MIC,
         icon_color=ft.Colors.CYAN_ACCENT,
         tooltip="Dictar tema",
     )
     boton_foto = ft.Button("Leer texto y rimar una foto")
+    boton_foto_voz = ft.Button("Rimar foto + instrucción de voz")
     boton_texto = ft.Button("Inspirar con un archivo .txt")
     nombre_foto = ft.Text()
     texto_leido = ft.Text()
@@ -90,6 +141,7 @@ def vista(page: ft.Page | None = None) -> ft.Control:
     )
     vista_previa = ft.Container()
     pcm = bytearray()
+    imagen_para_audio: bytes | None = None
     grabando = False
     procesando_audio = False
     tarea_limite: asyncio.Task | None = None
@@ -97,6 +149,23 @@ def vista(page: ft.Page | None = None) -> ft.Control:
     def actualizar_humor(e):
         humor_valor.value = f"Humor: {int(e.control.value)} / 5"
         e.page.update()
+
+    def actualizar_calificacion(e, positiva: bool):
+        nonlocal me_gusta, no_me_gusta
+        if positiva:
+            me_gusta += 1
+        else:
+            no_me_gusta += 1
+        estadisticas_calificacion.value = (
+            f"👍 {me_gusta} me gusta  ·  👎 {no_me_gusta} no me gusta"
+        )
+        e.page.update()
+
+    def registrar_me_gusta(e):
+        actualizar_calificacion(e, positiva=True)
+
+    def registrar_no_me_gusta(e):
+        actualizar_calificacion(e, positiva=False)
 
     def acumular_audio(e: AudioRecorderStreamEvent):
         pcm.extend(e.chunk)
@@ -127,16 +196,86 @@ def vista(page: ft.Page | None = None) -> ft.Control:
         if lanzador_url not in pagina.services:
             pagina.services.append(lanzador_url)
 
+    def actualizar_limite():
+        disponibles = max(0, MAX_GENERACIONES - generaciones)
+        contador_generaciones.value = (
+            f"Generaciones disponibles: {disponibles} / {MAX_GENERACIONES}"
+        )
+        agotado = disponibles == 0
+        boton.disabled = agotado
+        boton_microfono.disabled = agotado
+        boton_foto.disabled = agotado
+        boton_foto_voz.disabled = agotado
+        boton_texto.disabled = agotado
+
     def mostrar_alerta(pagina: ft.Page, mensaje: str, color=ft.Colors.ORANGE):
         estado.value = mensaje
         estado.color = color
+        alerta_texto.value = mensaje
+        alerta_texto.color = ft.Colors.WHITE
+        tarjeta_alerta.content.content.controls[0].color = color
+        tarjeta_alerta.content.border = ft.Border.all(1, color)
+        tarjeta_alerta.content.bgcolor = (
+            "#3B2A17" if color == ft.Colors.ORANGE else "#3B1D25"
+        )
+        tarjeta_alerta.visible = True
         pagina.update()
+
+    def informar_error(pagina: ft.Page, error: Exception, mensaje: str):
+        explicacion = mensaje
+        if isinstance(error, RuntimeError):
+            detalle = str(error).lower()
+            if "429" in detalle or "rate limit" in detalle or "too many" in detalle:
+                explicacion = (
+                    "El servicio está recibiendo demasiadas solicitudes. "
+                    "Espera un poco y vuelve a intentarlo."
+                )
+            elif "400" in detalle:
+                explicacion = (
+                    "La solicitud no pudo procesarse. Revisa el contenido e "
+                    "inténtalo de nuevo."
+                )
+            elif any(
+                palabra in detalle
+                for palabra in ("network", "connection", "connect", "timeout", "red")
+            ):
+                explicacion = (
+                    "No se pudo conectar con el servicio. Revisa tu conexión "
+                    "a internet e inténtalo de nuevo."
+                )
+            else:
+                explicacion = (
+                    "El servicio de rimas tuvo un problema. Inténtalo de nuevo "
+                    "dentro de unos momentos."
+                )
+        mostrar_alerta(pagina, explicacion, ft.Colors.RED)
+
+    def reservar_generacion(pagina: ft.Page) -> bool:
+        nonlocal generaciones
+        if generaciones >= MAX_GENERACIONES:
+            mostrar_alerta(
+                pagina,
+                "Has alcanzado el límite de 10 rimas para esta sesión.",
+            )
+            actualizar_limite()
+            return False
+        generaciones += 1
+        actualizar_limite()
+        return True
 
     def validar_texto(texto: str, pagina: ft.Page, origen: str) -> str | None:
         texto = texto.strip()
         if not texto:
             mostrar_alerta(pagina, f"No hay texto en {origen} para crear la rima.")
             return None
+        for patron, tipo_dato in PATRONES_DATOS_SENSIBLES:
+            if patron.search(texto):
+                mostrar_alerta(
+                    pagina,
+                    f"Por privacidad, no puedo procesar {origen} porque contiene "
+                    f"{tipo_dato}. Elimina ese dato y vuelve a intentarlo.",
+                )
+                return None
         if len(texto) > 500:
             mostrar_alerta(
                 pagina,
@@ -146,11 +285,13 @@ def vista(page: ft.Page | None = None) -> ft.Control:
         return texto
 
     def iniciar_carga(pagina: ft.Page, mensaje: str):
+        tarjeta_alerta.visible = False
         for accion in (
             boton,
             boton_copiar,
             boton_microfono,
             boton_foto,
+            boton_foto_voz,
             boton_texto,
             genero,
             humor,
@@ -162,14 +303,8 @@ def vista(page: ft.Page | None = None) -> ft.Control:
         pagina.update()
 
     def finalizar_carga(pagina: ft.Page):
-        for accion in (
-            boton,
-            boton_microfono,
-            boton_foto,
-            boton_texto,
-            genero,
-            humor,
-        ):
+        actualizar_limite()
+        for accion in (genero, humor):
             accion.disabled = False
         boton_copiar.disabled = rima_actual is None
         progreso.visible = False
@@ -241,13 +376,11 @@ def vista(page: ft.Page | None = None) -> ft.Control:
         try:
             registrar_lanzador_url(pagina)
             await lanzador_url.launch_url(url, web_only_window_name="_blank")
-        except Exception:
-            pagina.show_dialog(
-                ft.SnackBar(
-                    content="No pude iniciar la lectura en voz alta en este navegador.",
-                    duration=3000,
-                    bgcolor=ft.Colors.RED_700,
-                )
+        except Exception as error:
+            informar_error(
+                pagina,
+                error,
+                "No pude iniciar la lectura en voz alta en este navegador.",
             )
         finally:
             pagina.update()
@@ -268,6 +401,8 @@ def vista(page: ft.Page | None = None) -> ft.Control:
             del rimas_anteriores[:-5]
         rima_actual = respuesta.copy()
         boton_copiar.disabled = False
+        boton_me_gusta.disabled = False
+        boton_no_me_gusta.disabled = False
         mostrar_rima(rima_actual)
         mostrar_historial()
 
@@ -309,15 +444,12 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                 )
             )
             pagina.update()
-        except Exception:
-            pagina.show_dialog(
-                ft.SnackBar(
-                    content="No pude copiar la rima al portapapeles.",
-                    duration=3000,
-                    bgcolor=ft.Colors.RED_700,
-                )
+        except Exception as error:
+            informar_error(
+                pagina,
+                error,
+                "No pude copiar la rima al portapapeles.",
             )
-            pagina.update()
 
     def contexto_historial() -> str:
         recientes = [*rimas_anteriores, *([rima_actual] if rima_actual else [])][-5:]
@@ -373,6 +505,8 @@ def vista(page: ft.Page | None = None) -> ft.Control:
         tema = validar_texto(entrada.value or "", pagina, "el tema")
         if tema is None:
             return
+        if not reservar_generacion(pagina):
+            return
 
         instruccion = (
             "Compón una rima original en español sobre el tema indicado. "
@@ -383,15 +517,21 @@ def vista(page: ft.Page | None = None) -> ft.Control:
         try:
             await crear_rima(tema, instruccion)
             estado.value = ""
-        except Exception:
+        except Exception as error:
             # Informa del fallo sin mostrar detalles técnicos al usuario.
-            estado.value = "No pude crear la rima. Inténtalo de nuevo."
-            estado.color = ft.Colors.RED
+            informar_error(
+                pagina,
+                error,
+                "No pude crear la rima. Inténtalo de nuevo.",
+            )
         finally:
             finalizar_carga(pagina)
 
     async def rimar_foto(e):
         pagina = e.page
+        if generaciones >= MAX_GENERACIONES:
+            reservar_generacion(pagina)
+            return
         try:
             registrar_selector(pagina)
             seleccion = await selector.pick_files(
@@ -415,7 +555,7 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                 src=imagen.bytes,
                 width=280,
                 height=200,
-                fit=ft.ImageFit.CONTAIN,
+                fit=ft.BoxFit.CONTAIN,
                 border_radius=8,
             )
             iniciar_carga(pagina, "Leyendo el texto de la imagen...")
@@ -444,6 +584,8 @@ def vista(page: ft.Page | None = None) -> ft.Control:
             texto_leido.value = f"Texto leído: {texto_extraido}"
             estado.value = "Componiendo una rima con ese texto..."
             pagina.update()
+            if not reservar_generacion(pagina):
+                return
 
             respuesta = await asyncio.to_thread(
                 ia_media,
@@ -464,10 +606,13 @@ def vista(page: ft.Page | None = None) -> ft.Control:
             respuesta = validar_respuesta_rima(respuesta)
             registrar_rima(respuesta)
             estado.value = ""
-        except Exception:
+        except Exception as error:
             # Muestra un aviso claro si la selección o la creación de la rima falla.
-            estado.value = "No pude crear una rima con esa imagen. Inténtalo de nuevo."
-            estado.color = ft.Colors.RED
+            informar_error(
+                pagina,
+                error,
+                "No pude crear una rima con esa imagen. Inténtalo de nuevo.",
+            )
         finally:
             finalizar_carga(pagina)
 
@@ -506,6 +651,8 @@ def vista(page: ft.Page | None = None) -> ft.Control:
             datos_documento.value = (
                 f"Archivo: {archivo.name} · {cantidad_palabras} palabras"
             )
+            if not reservar_generacion(pagina):
+                return
             iniciar_carga(pagina, "Componiendo una rima inspirada en el documento...")
 
             await crear_rima(
@@ -515,24 +662,31 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                 "y describe el estilo del poema.",
             )
             estado.value = ""
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as error:
             # El documento debe estar guardado como texto UTF-8.
-            estado.value = "No pude leer el archivo. Asegúrate de que esté codificado en UTF-8."
-            estado.color = ft.Colors.RED
-        except Exception:
+            informar_error(
+                pagina,
+                error,
+                "No pude leer el archivo. Asegúrate de que esté codificado en UTF-8.",
+            )
+        except Exception as error:
             # Muestra un mensaje sencillo si falla la lectura o la composición.
-            estado.value = "No pude crear una rima con ese documento. Inténtalo de nuevo."
-            estado.color = ft.Colors.RED
+            informar_error(
+                pagina,
+                error,
+                "No pude crear una rima con ese documento. Inténtalo de nuevo.",
+            )
         finally:
             finalizar_carga(pagina)
 
     async def finalizar_grabacion(pagina: ft.Page):
-        nonlocal grabando, procesando_audio, tarea_limite
+        nonlocal grabando, procesando_audio, tarea_limite, imagen_para_audio
         if not grabando or procesando_audio:
             return
 
         grabando = False
         procesando_audio = True
+        imagen = imagen_para_audio
         if tarea_limite is not None and tarea_limite is not asyncio.current_task():
             tarea_limite.cancel()
         tarea_limite = None
@@ -551,7 +705,7 @@ def vista(page: ft.Page | None = None) -> ft.Control:
             pcm.clear()
             transcripcion = await asyncio.to_thread(
                 ia_media,
-                "Transcribe en español el tema dictado. Devuelve únicamente "
+                "Transcribe en español el tema o la instrucción dictada. Devuelve únicamente "
                 "el texto transcrito, sin explicaciones.",
                 datos_wav,
                 "audio/wav",
@@ -559,55 +713,81 @@ def vista(page: ft.Page | None = None) -> ft.Control:
             tema = validar_texto(
                 transcripcion if isinstance(transcripcion, str) else "",
                 pagina,
-                "la transcripción",
+                "la instrucción dictada" if imagen else "la transcripción",
             )
             if tema is None:
                 return
+            if not reservar_generacion(pagina):
+                return
 
             entrada.value = tema
-            estado.value = "Componiendo..."
+            if imagen:
+                texto_leido.value = f"Instrucción de voz: {tema}"
+                estado.value = "Componiendo una rima con la imagen y la voz..."
+            else:
+                estado.value = "Componiendo..."
             pagina.update()
-            await crear_rima(
-                tema,
-                "Compón una rima original en español sobre el tema indicado. "
-                "Elige un título y un estilo apropiados para el poema.",
-            )
+            if imagen:
+                instruccion = aplicar_estilo(
+                    "Usa conjuntamente la imagen y el audio adjuntos. La imagen "
+                    "aporta el objeto o lugar que inspira el poema; sigue la "
+                    "instrucción hablada para decidir el enfoque, tono o estilo. "
+                    "Compón en español una rima original de exactamente cuatro "
+                    "versos que se ajuste a ambos insumos. La transcripción de "
+                    "la instrucción hablada también se incluye como texto."
+                )
+                respuesta = await asyncio.to_thread(
+                    ia_media_multimodal,
+                    instruccion + "\n\n" + FORMATO_RIMA,
+                    [(imagen, "image/jpeg"), (datos_wav, "audio/wav")],
+                    f"Instrucción dictada: {tema}{contexto_historial()}",
+                    True,
+                )
+                respuesta = validar_respuesta_rima(respuesta)
+                registrar_rima(respuesta)
+            else:
+                await crear_rima(
+                    tema,
+                    "Compón una rima original en español sobre el tema indicado. "
+                    "Elige un título y un estilo apropiados para el poema.",
+                )
             estado.value = ""
             pagina.update()
-        except Exception:
+        except Exception as error:
             # Mantiene un mensaje sencillo ante errores de grabación o transcripción.
-            estado.value = "No pude procesar el audio. Inténtalo de nuevo."
-            estado.color = ft.Colors.RED
+            informar_error(
+                pagina,
+                error,
+                "No pude procesar el audio. Inténtalo de nuevo.",
+            )
         finally:
             pcm.clear()
             procesando_audio = False
+            imagen_para_audio = None
             finalizar_carga(pagina)
 
     async def detener_al_limite(pagina: ft.Page):
         await asyncio.sleep(30)
         await finalizar_grabacion(pagina)
 
-    async def alternar_microfono(e):
-        nonlocal grabando, tarea_limite
-        pagina = e.page
-
-        if grabando:
-            await finalizar_grabacion(pagina)
+    async def iniciar_grabacion(pagina: ft.Page, imagen: bytes | None = None):
+        nonlocal grabando, tarea_limite, imagen_para_audio
+        if generaciones >= MAX_GENERACIONES:
+            reservar_generacion(pagina)
             return
 
         url = (pagina.url or "").lower()
         if not url.startswith("https://"):
-            estado.value = "Para grabar voz, abre esta app mediante HTTPS."
-            estado.color = ft.Colors.ORANGE
-            pagina.update()
+            mostrar_alerta(
+                pagina,
+                "Para grabar voz, abre esta app mediante HTTPS.",
+            )
             return
 
         try:
             registrar_grabadora(pagina)
             if not await grabadora.has_permission():
-                estado.value = "Necesitas permitir el acceso al micrófono."
-                estado.color = ft.Colors.ORANGE
-                pagina.update()
+                mostrar_alerta(pagina, "Necesitas permitir el acceso al micrófono.")
                 return
 
             pcm.clear()
@@ -619,34 +799,91 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                 )
                 return
 
+            imagen_para_audio = imagen
             grabando = True
             boton.disabled = True
             boton_foto.disabled = True
+            boton_foto_voz.disabled = True
             boton_texto.disabled = True
             boton_microfono.icon = ft.Icons.STOP
             boton_microfono.tooltip = "Detener grabación"
-            estado.value = "Grabando..."
+            estado.value = (
+                "Grabando... Describe en voz alta el estilo o la instrucción para la rima."
+                if imagen
+                else "Grabando..."
+            )
             estado.color = ft.Colors.CYAN_ACCENT
             pagina.update()
             tarea_limite = asyncio.create_task(detener_al_limite(pagina))
-        except Exception:
+        except Exception as error:
             # Explica el fallo sin exponer detalles técnicos de permisos o del dispositivo.
-            estado.value = "No pude acceder al micrófono. Revisa los permisos e inténtalo."
-            estado.color = ft.Colors.RED
-            boton.disabled = False
-            boton_foto.disabled = False
-            boton_texto.disabled = False
+            imagen_para_audio = None
+            informar_error(
+                pagina,
+                error,
+                "No pude acceder al micrófono. Revisa los permisos e inténtalo.",
+            )
+            actualizar_limite()
             boton_microfono.icon = ft.Icons.MIC
             boton_microfono.tooltip = "Dictar tema"
             pagina.update()
+
+    async def rimar_foto_con_voz(e):
+        pagina = e.page
+        if generaciones >= MAX_GENERACIONES:
+            reservar_generacion(pagina)
+            return
+
+        try:
+            registrar_selector(pagina)
+            seleccion = await selector.pick_files(
+                file_type=ft.FilePickerFileType.IMAGE,
+                with_data=True,
+            )
+            if not seleccion:
+                return
+
+            imagen = seleccion[0]
+            if not imagen.bytes:
+                mostrar_alerta(pagina, "No pude leer la imagen seleccionada.")
+                return
+
+            nombre_foto.value = imagen.name
+            texto_leido.value = ""
+            datos_documento.value = ""
+            vista_previa.content = ft.Image(
+                src=imagen.bytes,
+                width=280,
+                height=200,
+                fit=ft.BoxFit.CONTAIN,
+                border_radius=8,
+            )
+            pagina.update()
+            await iniciar_grabacion(pagina, imagen.bytes)
+        except Exception as error:
+            informar_error(
+                pagina,
+                error,
+                "No pude preparar la foto y la grabación. Inténtalo de nuevo.",
+            )
+
+    async def alternar_microfono(e):
+        pagina = e.page
+        if grabando:
+            await finalizar_grabacion(pagina)
+            return
+        await iniciar_grabacion(pagina)
 
     async def generar_desde_boton(e):
         await generar(e.page)
 
     boton.on_click = generar_desde_boton
     boton_copiar.on_click = copiar_rima
+    boton_me_gusta.on_click = registrar_me_gusta
+    boton_no_me_gusta.on_click = registrar_no_me_gusta
     boton_microfono.on_click = alternar_microfono
     boton_foto.on_click = rimar_foto
+    boton_foto_voz.on_click = rimar_foto_con_voz
     boton_texto.on_click = rimar_documento
 
     if page is not None:
@@ -656,25 +893,90 @@ def vista(page: ft.Page | None = None) -> ft.Control:
     return ft.Container(
         content=ft.Column(
             [
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Row(
+                                [
+                                    ft.Container(
+                                        content=ft.Icon(
+                                            ft.Icons.MIC,
+                                            color="#F0ABFC",
+                                            size=28,
+                                        ),
+                                        bgcolor="#3B1D45",
+                                        padding=12,
+                                        border_radius=14,
+                                    ),
+                                    ft.Column(
+                                        [
+                                            ft.Text(
+                                                "Rimador 🎤",
+                                                size=30,
+                                                weight=ft.FontWeight.BOLD,
+                                                color="#22D3EE",
+                                            ),
+                                            ft.Text(
+                                                "CREATIVIDAD EN VERSO",
+                                                size=11,
+                                                weight=ft.FontWeight.BOLD,
+                                                color="#E879F9",
+                                            ),
+                                        ],
+                                        spacing=2,
+                                    ),
+                                ],
+                                spacing=14,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                            ft.Divider(color="#334155", height=1),
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        "Crea versos originales y rimas a partir de un tema, tu voz, una imagen o un texto.",
+                                        color="#E2E8F0",
+                                    ),
+                                    ft.Text(
+                                        "Personaliza el estilo y el humor; después, escucha o copia tu rima.",
+                                        color="#CBD5E1",
+                                    ),
+                                    ft.Text(
+                                        "Rimador no genera canciones completas ni audio musical: crea poemas en texto.",
+                                        color="#F0ABFC",
+                                    ),
+                                ],
+                                spacing=6,
+                            ),
+                        ],
+                        spacing=12,
+                    ),
+                    bgcolor="#111827",
+                    border=ft.Border.all(1, "#22D3EE"),
+                    border_radius=18,
+                    padding=20,
+                ),
                 ft.Text(
-                    "Rimador",
-                    size=24,
-                    weight=ft.FontWeight.BOLD,
-                    color=ft.Colors.CYAN_ACCENT,
+                    "La IA puede cometer errores. Verifica la información.",
+                    color="#CBD5E1",
+                    size=12,
+                    italic=True,
                 ),
                 entrada,
+                contador_generaciones,
                 genero,
                 humor_valor,
                 humor,
                 ft.Row([boton, boton_microfono], spacing=8),
                 boton_copiar,
                 boton_foto,
+                boton_foto_voz,
                 boton_texto,
                 nombre_foto,
                 texto_leido,
                 datos_documento,
                 vista_previa,
                 progreso,
+                tarjeta_alerta,
                 estado,
                 ft.Text(
                     "Rima actual",
@@ -683,6 +985,10 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                     color=ft.Colors.CYAN_ACCENT,
                 ),
                 poema,
+                ft.Row(
+                    [boton_me_gusta, boton_no_me_gusta],
+                    spacing=8,
+                ),
                 ft.Text(
                     "Historial de rimas anteriores",
                     size=18,
@@ -690,6 +996,23 @@ def vista(page: ft.Page | None = None) -> ft.Control:
                     color=ft.Colors.CYAN_ACCENT,
                 ),
                 historial,
+                ft.Card(
+                    content=ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    "Estadísticas de esta sesión",
+                                    weight=ft.FontWeight.BOLD,
+                                    color=ft.Colors.CYAN_ACCENT,
+                                ),
+                                estadisticas_calificacion,
+                            ],
+                            spacing=6,
+                        ),
+                        padding=14,
+                    ),
+                    elevation=2,
+                ),
             ],
             spacing=12,
             expand=True,
